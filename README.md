@@ -1,2 +1,2 @@
 # airplane-mode
-setup and run LLM locally without internet for plane coding work 
+setup and run LLMs locally without internet for plane coding work 
