@@ -40,12 +40,25 @@ running the agent inside a container/sandbox.
 # 1. 🛜 Clone + run once on good WiFi (acknowledges a security notice, then sets up)
 git clone https://github.com/daniilrrr/airplane-mode.git
 cd airplane-mode
-bash ./src/airplane-mode.sh
+bash ./src/airplane-mode.sh                    # default: Ollama engine
+# or, for the power-user path:
+bash ./src/airplane-mode.sh --engine llama.cpp
 
 # 2. ✈️ Any time you want to code offline:
 airplane-mode                 # launches OpenCode + your model
-airplane-mode qwen3.6:27b     # or pick a different model
+airplane-mode qwen3.6:27b     # (ollama engine) pick a different model
 ```
+
+## Engines: Ollama vs. llama.cpp
+
+Pick your runtime with `--engine`:
+
+| Engine | `--engine` | Best for | Trade-off |
+| ------ | ---------- | -------- | --------- |
+| **Ollama** (default) | `ollama` | Easiest setup, `ollama pull`, auto-wired `ollama launch` | An abstraction layer; less control |
+| **llama.cpp** | `llama.cpp` | Max control, raw tuned flags, fewer black-box surprises | More setup; you manage GGUF + flags |
+
+> **Note:** Ollama is itself a **wrapper around [llama.cpp](https://github.com/ggml-org/llama.cpp)** — the actual open-source inference engine that does the work. The `--engine llama.cpp` path talks to that engine directly (full credit upstream), runs a tuned `llama-server`, and points OpenCode at its OpenAI-compatible endpoint. Same models, fewer abstractions.
 
 **Before you fly:** turn WiFi OFF on the ground and run a real task. If it works
 dry, it works at 40,000 feet.
