@@ -1,85 +1,285 @@
 #!/usr/bin/env bash
-#
-#  █████╗ ██╗██████╗ ██████╗ ██╗      █████╗ ███╗   ██╗███████╗
-# ██╔══██╗██║██╔══██╗██╔══██╗██║     ██╔══██╗████╗  ██║██╔════╝
-# ███████║██║██████╔╝██████╔╝██║     ███████║██╔██╗ ██║█████╗
-# ██╔══██║██║██╔══██╗██╔═══╝ ██║     ██╔══██║██║╚██╗██║██╔══╝
-# ██║  ██║██║██║  ██║██║     ███████╗██║  ██║██║ ╚████║███████╗
-# ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝
-#                    M O D E   ✈
-#
-# One-stop setup for offline (plane / no-WiFi) local LLM coding on macOS.
-# Bundles: Ollama (official) + Qwen3 models + OpenCode harness + tuned env.
-#
-# ─────────────────────────────────────────────────────────────────────────────
-#  ⚠️  SECURITY WARNING — READ BEFORE RUNNING
-# ─────────────────────────────────────────────────────────────────────────────
-#  A coding agent (harness) runs with YOUR user permissions and can read/write
-#  files and execute shell commands. Treat EVERY component — the harness, the
-#  model, and ESPECIALLY any plugins / extensions / skills — as a potential
-#  ATTACK SURFACE and supply-chain risk.
-#
-#  This script deliberately installs ONLY:
-#    • Ollama (official installer — NOT Homebrew)
-#    • Qwen3 model(s) from the official Ollama library
-#    • OpenCode (open-source harness by SST)
-#
-#  It installs NO third-party plugins, extensions, MCP servers, or skills.
-#  If you add any of those yourself, you own that risk. For work on sensitive
-#  or proprietary repositories, clear agent usage with your security/AppSec team
-#  first, and consider running the agent inside a container/sandbox.
-# ─────────────────────────────────────────────────────────────────────────────
-
 set -euo pipefail
 
-# ── Colors ───────────────────────────────────────────────────────────────────
-BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'
-YEL=$'\033[33m'; CYN=$'\033[36m'; RST=$'\033[0m'
+DEFAULT_MODEL='qwen3.8:27b-q4_K_M'
+CODING_MODEL='qwen3-coder:30b'
+DEFAULT_HF_REPO='unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M'
+CODING_HF_REPO='Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M'
+MARK_BEGIN='# >>> airplane-mode env >>>'
+MARK_END='# <<< airplane-mode env <<<'
 
-say()  { printf "%s\n" "$*"; }
-ok()   { printf "${GRN}✓${RST} %s\n" "$*"; }
-warn() { printf "${YEL}⚠${RST}  %s\n" "$*"; }
-err()  { printf "${RED}✗${RST} %s\n" "$*" >&2; }
-hdr()  { printf "\n${BOLD}${CYN}%s${RST}\n" "$*"; }
+say() { printf '%s\n' "$*"; }
+fail() { printf 'Error: %s\n' "$*" >&2; return 1; }
 
-# ── Arg parsing ──────────────────────────────────────────────────────────────
-# --engine ollama   (default) → easy path, Ollama runtime
-# --engine llama.cpp          → power-user path, raw llama.cpp + llama-server
-ENGINE="ollama"
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --engine)
-      ENGINE="${2:-}"; shift 2 ;;
-    --engine=*)
-      ENGINE="${1#*=}"; shift ;;
-    -h|--help)
-      cat <<USAGE
-Airplane Mode — offline local LLM coding setup
+install_script() {
+  local url="$1" script
+  script=$(mktemp) || return
+  if ! curl -fsSL --connect-timeout 15 --max-time 120 "$url" -o "$script"; then
+    rm -f "$script"
+    fail "Could not download $url"; return 1
+  fi
+  local rc=0
+  OLLAMA_NO_START=1 bash "$script" || rc=$?
+  rm -f "$script"
+  return "$rc"
+}
 
-Usage: bash airplane-mode.sh [--engine ollama|llama.cpp]
+brew_formula() {
+  local tool="$1" path="$2" formula prefix
+  command -v brew >/dev/null 2>&1 || return 1
+  local formulas
+  formulas=$(brew list --formula --full-name) || return 2
+  while IFS= read -r formula; do
+    case "$tool:${formula##*/}" in
+      opencode:opencode|opencode:opencode-v2|ollama:ollama|llama-server:llama.cpp)
+        prefix=$(brew --prefix "$formula") || return 2
+        prefix=$(/usr/bin/perl -MCwd=abs_path -e 'print abs_path($ARGV[0]) // die "Cannot resolve Homebrew prefix\n"' "$prefix") || return 2
+        case "$path" in "$prefix"/*) printf '%s\n' "$formula"; return 0 ;; esac ;;
+    esac
+  done <<EOF
+$formulas
+EOF
+  return 1
+}
 
-  --engine ollama      (default) Easy path: Ollama runtime + 'ollama launch'.
-  --engine llama.cpp   Power-user path: raw llama.cpp engine + llama-server.
-                       More control, fewer abstractions. Note: Ollama is itself
-                       a wrapper around llama.cpp — this talks to the engine directly.
-  -h, --help           Show this help.
-USAGE
-      exit 0 ;;
-    *)
-      err "Unknown argument: $1 (try --help)"; exit 1 ;;
+update_tool() {
+  local tool="$1" path resolved formula
+  path=$(command -v "$tool") || { say "$tool is not installed; skipped."; return 0; }
+  resolved=$(/usr/bin/perl -MCwd=abs_path -e 'print abs_path($ARGV[0]) // die "Cannot resolve executable\n"' "$path") || return
+  local casks manager_status
+  if [ "$tool" = ollama ] && command -v brew >/dev/null 2>&1; then
+    casks=$(brew list --cask --full-name) || return
+    if printf '%s\n' "$casks" | grep -qx ollama; then
+      case "$resolved" in
+        /Applications/Ollama.app/*) brew upgrade --cask ollama; return ;;
+      esac
+    fi
+  fi
+  if formula=$(brew_formula "$tool" "$resolved"); then
+    say "Updating $tool with Homebrew ($formula)."
+    brew upgrade "$formula"
+    return
+  else
+    manager_status=$?
+    [ "$manager_status" -eq 1 ] || { fail "Could not inspect the Homebrew installation for $tool."; return 1; }
+  fi
+  case "$tool:$resolved" in
+    ollama:/Applications/Ollama.app/*)
+      install_script https://ollama.com/install.sh ;;
+    opencode:*/.opencode/bin/opencode)
+      install_script https://opencode.ai/v2/install ;;
+    *) fail "Cannot safely update $path. Update $tool with its original installer, then rerun setup." ;;
   esac
-done
+}
 
-case "$ENGINE" in
-  ollama|llama.cpp|llamacpp) ;;
-  *) err "Invalid --engine '$ENGINE'. Use 'ollama' or 'llama.cpp'."; exit 1 ;;
-esac
-[ "$ENGINE" = "llamacpp" ] && ENGINE="llama.cpp"
+ensure_tools() {
+  if ! command -v opencode >/dev/null 2>&1; then
+    if command -v brew >/dev/null 2>&1; then brew install opencode || return
+    else install_script https://opencode.ai/v2/install || return
+    fi
+    export PATH="$HOME/.opencode/bin:$PATH"
+  fi
+  local version
+  version=$(opencode --version) || return
+  version="${version##* }"
+  case "$version" in 2.*|v2.*) ;; *) fail "OpenCode v2 is required (found $version). Run setup --update or update with its original manager."; return 1 ;; esac
+  if [ "$ENGINE" = ollama ]; then
+    command -v ollama >/dev/null 2>&1 || install_script https://ollama.com/install.sh
+  elif ! command -v llama-server >/dev/null 2>&1; then
+    command -v brew >/dev/null 2>&1 || { fail 'Install llama.cpp from https://github.com/ggml-org/llama.cpp or install Homebrew, then rerun.'; return 1; }
+    brew install llama.cpp || return
+  fi
+}
 
-# ── 0. Banner + security gate ────────────────────────────────────────────────
-printf '\033[2J\033[H' 2>/dev/null || true   # clear screen (portable-ish)
-printf "${CYN}${BOLD}"
-cat <<'BANNER'
+write_launcher_block() {
+  printf '%s\n' "$MARK_BEGIN"
+  cat <<'COMMON'
+_airplane_wait() {
+  local url="$1" pid="$2" limit="$3" log="$4" attempt=0
+  while [ "$attempt" -lt "$limit" ]; do
+    if curl -fsS --connect-timeout 1 --max-time 2 "$url" >/dev/null 2>&1; then return 0; fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      printf 'Server exited before becoming ready. See %s\n' "$log" >&2; return 1
+    fi
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  printf 'Server readiness timed out. See %s\n' "$log" >&2
+  return 1
+}
+COMMON
+  if [ "$ENGINE" = ollama ]; then
+    printf "_airplane_default_model='%s'\n" "$SELECTED_MODEL"
+    cat <<'OLLAMA'
+_airplane_ready() {
+  export OLLAMA_HOST=127.0.0.1:11434 OLLAMA_NO_CLOUD=1
+  export OLLAMA_CONTEXT_LENGTH=64000 OLLAMA_FLASH_ATTENTION=1
+  export OLLAMA_KV_CACHE_TYPE=q8_0 OLLAMA_KEEP_ALIVE=-1
+  if curl -fsS --connect-timeout 1 --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then return 0; fi
+  local log="$HOME/.airplane-ollama.log" pid
+  nohup ollama serve >"$log" 2>&1 &
+  pid=$!
+  _airplane_wait http://127.0.0.1:11434/api/tags "$pid" 60 "$log"
+}
+_airplane_check() {
+  _airplane_ready || return
+  if ! ollama show "$1" >/dev/null; then
+    printf 'Model is unavailable locally. While online run: OLLAMA_HOST=127.0.0.1:11434 ollama pull %s\n' "$1" >&2
+    return 1
+  fi
+}
+airplane-mode() (
+  [ "$#" -le 1 ] || { printf 'Usage: airplane-mode [model]\n' >&2; return 1; }
+  local model="${1:-$_airplane_default_model}"
+  _airplane_check "$model" || return
+  OPENCODE_DISABLE_AUTOUPDATE=true ollama launch opencode --model "$model" -- --standalone
+)
+_airplane_smoke() (
+  _airplane_check "$_airplane_default_model" || return
+  curl -fsS --connect-timeout 5 --max-time 180 http://127.0.0.1:11434/api/generate \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$_airplane_default_model\",\"prompt\":\"Say hello.\",\"stream\":false,\"options\":{\"num_predict\":16}}" | /usr/bin/perl -MJSON::PP -e '
+      local $/; my $v = decode_json(<STDIN> // "");
+      die "No completed model response\n" unless $v->{done} && length(($v->{response} // "") . ($v->{thinking} // ""));
+      print(($v->{response} || $v->{thinking}), "\n");' || return
+  OPENCODE_DISABLE_AUTOUPDATE=true ollama launch opencode --model "$_airplane_default_model" -- --standalone --version
+)
+OLLAMA
+  else
+    printf "_airplane_default_repo='%s'\n_airplane_model_alias='%s'\n" "$HF_REPO" "$MODEL_ALIAS"
+    cat <<'LLAMA'
+airplane-serve() (
+  [ "$#" -le 1 ] || { printf 'Usage: airplane-serve [configured-HF-repository:quant]\n' >&2; return 1; }
+  local repo="${1:-$_airplane_default_repo}" log="$HOME/.airplane-llamacpp.log" pid
+  if [ "$repo" != "$_airplane_default_repo" ]; then
+    printf 'Rerun bash src/airplane-mode.sh --engine llama.cpp to select and prepare a different default, then source the updated profile and stop the old server yourself.\n' >&2; return 1
+  fi
+  if curl -fsS --connect-timeout 1 --max-time 2 http://127.0.0.1:8080/health >/dev/null 2>&1; then
+    return 0
+  fi
+  nohup llama-server -hf "$repo" --alias "$_airplane_model_alias" \
+    --host 127.0.0.1 --port 8080 -c 64000 -fa on -ctk q8_0 -ctv q8_0 \
+    --offline --no-webui >"$log" 2>&1 &
+  pid=$!
+  _airplane_wait http://127.0.0.1:8080/health "$pid" 180 "$log"
+)
+_airplane_check() {
+  airplane-serve "$1" || return
+  local models
+  models=$(curl -fsS --connect-timeout 2 --max-time 5 http://127.0.0.1:8080/v1/models) || return
+  if ! printf '%s' "$models" | grep -Fq "\"$_airplane_model_alias\""; then
+    printf 'The running llama-server does not advertise %s. Stop it yourself and retry.\n' "$_airplane_model_alias" >&2
+    return 1
+  fi
+}
+airplane-mode() (
+  [ "$#" -le 1 ] || { printf 'Usage: airplane-mode [configured-HF-repository:quant]\n' >&2; return 1; }
+  _airplane_check "${1:-$_airplane_default_repo}" || return
+  OPENCODE_DISABLE_AUTOUPDATE=true OPENCODE_CONFIG_CONTENT="{\"providers\":{\"airplane\":{\"package\":\"@opencode/ai/providers/openai-compatible\",\"settings\":{\"baseURL\":\"http://127.0.0.1:8080/v1\",\"apiKey\":\"local\"},\"models\":{\"$_airplane_model_alias\":{\"limit\":{\"context\":64000,\"output\":8192},\"capabilities\":{\"tools\":true}}}}}}" \
+    opencode --standalone --model "airplane/$_airplane_model_alias"
+)
+_airplane_smoke() (
+  _airplane_check "$_airplane_default_repo" || return
+  curl -fsS --connect-timeout 5 --max-time 180 http://127.0.0.1:8080/completion \
+    -H 'Content-Type: application/json' -d '{"prompt":"Say hello.","n_predict":16}' | /usr/bin/perl -MJSON::PP -e '
+      local $/; my $v = decode_json(<STDIN> // "");
+      die "No model response\n" unless length($v->{content} // "");
+      print $v->{content}, "\n";'
+)
+LLAMA
+  fi
+  printf '%s\n' "$MARK_END"
+}
+
+replace_profile_block() {
+  /usr/bin/perl - "$PROFILE" "$1" "$MARK_BEGIN" "$MARK_END" <<'PERL'
+use strict;
+use warnings;
+use Cwd qw(abs_path);
+use File::Basename qw(dirname);
+use File::Copy qw(copy);
+use File::Temp qw(tempfile);
+my ($profile, $blockfile, $begin, $end) = @ARGV;
+my $target = -l $profile ? abs_path($profile) : $profile;
+defined $target or die "Cannot resolve profile symlink $profile\n";
+my $original = '';
+my $mode = 0600;
+if (-e $target) {
+  open my $in, '<', $target or die "Read $target: $!\n";
+  local $/; $original = <$in>; close $in or die "Close $target: $!\n";
+  $mode = (stat $target)[2] & 07777;
+}
+my @begins = ($original =~ /^\Q$begin\E\r?$/mg);
+my @ends = ($original =~ /^\Q$end\E\r?$/mg);
+(@begins == @ends && @begins <= 1) or die "Malformed airplane-mode profile markers in $profile\n";
+open my $input, '<', $blockfile or die "Read launcher: $!\n";
+local $/; my $block = <$input>; close $input or die "Close launcher: $!\n";
+my $updated = $original;
+if (@begins) {
+  $updated =~ s/^\Q$begin\E\r?\n.*?^\Q$end\E\r?(?:\n|\z)/$block/msg
+    or die "Reversed or malformed airplane-mode profile markers in $profile\n";
+} else {
+  $updated .= "\n" if length($updated) && $updated !~ /\n\z/;
+  $updated .= $block;
+}
+exit 0 if $updated eq $original;
+if (-e $target) {
+  my ($backup, $backupname) = tempfile("$target.airplane-backup.XXXXXX", UNLINK => 0);
+  close $backup or die "Close backup: $!\n";
+  copy($target, $backupname) or die "Backup $target: $!\n";
+  chmod($mode, $backupname) or die "Set backup permissions: $!\n";
+  print "Backup: $backupname\n";
+}
+my ($out, $temporary) = tempfile('.airplane-profile.XXXXXX', DIR => dirname($target), UNLINK => 0);
+print {$out} $updated or die "Write profile: $!\n";
+close $out or die "Close profile: $!\n";
+chmod($mode, $temporary) or die "Set profile permissions: $!\n";
+rename($temporary, $target) or die "Replace profile: $!\n";
+PERL
+}
+
+prepare_llama_model() {
+  local log="$HOME/.airplane-llamacpp-download.log" pid rc=0
+  if curl -fsS --connect-timeout 1 --max-time 2 http://127.0.0.1:18080/health >/dev/null 2>&1; then
+    fail 'Port 18080 is already in use. Stop that server yourself before preparing the GGUF.'; return 1
+  fi
+  llama-server -hf "$HF_REPO" --host 127.0.0.1 --port 18080 -c 512 --no-webui >"$log" 2>&1 &
+  pid=$!
+  _airplane_wait http://127.0.0.1:18080/health "$pid" 600 "$log" || rc=$?
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" || return
+    local stopped=0
+    wait "$pid" || stopped=$?
+    case "$stopped" in 0|130|143) ;; *) fail "Model preparation exited with $stopped. See $log"; return 1 ;; esac
+  fi
+  [ "$rc" -eq 0 ] || return "$rc"
+  say "GGUF prepared. See $log"
+}
+
+main() {
+  ENGINE=ollama
+  local update=0 arg
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --engine) [ "$#" -ge 2 ] || { fail '--engine requires a value.'; return 1; }; ENGINE="$2"; shift 2 ;;
+      --engine=*) ENGINE="${1#*=}"; shift ;;
+      --update) update=1; shift ;;
+      -h|--help)
+        say 'Usage: bash src/airplane-mode.sh [--engine ollama|llama.cpp] [--update]'
+        say '--update upgrades existing tools for the selected engine and exits without downloading models.'
+        return 0 ;;
+      *) fail "Unknown argument $1. Try --help."; return 1 ;;
+    esac
+  done
+  case "$ENGINE" in ollama|llama.cpp) ;; llamacpp) ENGINE=llama.cpp ;; *) fail "Unknown engine $ENGINE"; return 1 ;; esac
+  [ "$(uname -s)" = Darwin ] || { fail 'This setup targets macOS.'; return 1; }
+  if [ "$update" -eq 1 ]; then
+    update_tool opencode || return
+    if [ "$ENGINE" = ollama ]; then update_tool ollama; else update_tool llama-server; fi
+    return
+  fi
+  if [ -t 1 ]; then printf '\033[1;36m'; fi
+  cat <<'BANNER'
  █████╗ ██╗██████╗ ██████╗ ██╗      █████╗ ███╗   ██╗███████╗
 ██╔══██╗██║██╔══██╗██╔══██╗██║     ██╔══██╗████╗  ██║██╔════╝
 ███████║██║██████╔╝██████╔╝██║     ███████║██╔██╗ ██║█████╗
@@ -88,327 +288,49 @@ cat <<'BANNER'
 ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝
                     M O D E   ✈
 BANNER
-printf "${RST}"
-say "${BOLD}${CYN}Offline local LLM coding setup${RST}"
-say "${DIM}macOS · Apple Silicon · ${ENGINE} + Qwen3 + OpenCode${RST}"
-hdr "⚠️  SECURITY NOTICE"
-say "A coding agent runs with YOUR permissions: it can read/write files and run"
-say "shell commands. Treat the harness, model, and ANY plugins/skills as potential"
-say "${BOLD}attack surfaces${RST}. This script installs ONLY official Ollama, Qwen3,"
-say "and OpenCode — ${BOLD}no third-party plugins or extensions${RST}. For sensitive/"
-say "proprietary repos, clear it with your security team and consider sandboxing."
-say ""
-read -r -p "Type 'yes' to acknowledge and continue: " _ack
-if [ "${_ack:-}" != "yes" ]; then err "Aborted."; exit 1; fi
-
-# ── 1. Preflight: macOS + Apple Silicon ──────────────────────────────────────
-hdr "1. Checking your system"
-if [ "$(uname -s)" != "Darwin" ]; then
-  err "This script targets macOS. Detected: $(uname -s). Aborting."
-  exit 1
-fi
-ARCH="$(uname -m)"
-if [ "$ARCH" = "arm64" ]; then
-  ok "Apple Silicon ($ARCH) — Metal GPU acceleration available."
-else
-  warn "Non-Apple-Silicon Mac ($ARCH) — will run on CPU (slow). Continuing anyway."
-fi
-
-PROFILE="${HOME}/.zshrc"
-[ -n "${ZSH_VERSION:-}" ] || [ -f "$PROFILE" ] || PROFILE="${HOME}/.bashrc"
-MARK_BEGIN="# >>> airplane-mode env >>>"
-MARK_END="# <<< airplane-mode env <<<"
-
-# =============================================================================
-#  ENGINE: OLLAMA  (default — the easy path)
-# =============================================================================
-if [ "$ENGINE" = "ollama" ]; then
-
-  # ── 2. Install Ollama (OFFICIAL — never Homebrew) ──────────────────────────
-  hdr "2. Installing Ollama (official build)"
-  say "${DIM}Note: the Homebrew formula ships without the llama-server engine — we use${RST}"
-  say "${DIM}the official installer, which bundles everything for Apple Silicon.${RST}"
-  if command -v ollama >/dev/null 2>&1; then
-    CUR_OLLAMA="$(command -v ollama)"
-    if echo "$CUR_OLLAMA" | grep -q "Cellar\|homebrew"; then
-      warn "Detected a Homebrew Ollama at $CUR_OLLAMA — this is the broken one."
-      warn "Run 'brew uninstall ollama' then re-run this script. (Your models are safe.)"
-      exit 1
+  if [ -t 1 ]; then printf '\033[0m'; fi
+  say 'Airplane Mode setup. This downloads tools and models while online.'
+  say 'OpenCode runs with your file and shell permissions. Review its actions and any plugins you add.'
+  local ack pick
+  read -r -p "Type 'yes' to continue: " ack
+  [ "$ack" = yes ] || { fail 'Aborted.'; return 1; }
+  ensure_tools || return
+  say "[1] $DEFAULT_MODEL (default)"
+  say "[2] $CODING_MODEL"
+  if [ "$ENGINE" = ollama ]; then say '[3] Both'; fi
+  read -r -p 'Choose [1]: ' pick
+  local models
+  case "${pick:-1}" in
+    1) SELECTED_MODEL="$DEFAULT_MODEL"; HF_REPO="$DEFAULT_HF_REPO"; MODEL_ALIAS=qwen38-27b; models=("$DEFAULT_MODEL") ;;
+    2) SELECTED_MODEL="$CODING_MODEL"; HF_REPO="$CODING_HF_REPO"; MODEL_ALIAS=qwen3-coder-30b; models=("$CODING_MODEL") ;;
+    3) [ "$ENGINE" = ollama ] || { fail 'Choose 1 or 2.'; return 1; }; SELECTED_MODEL="$DEFAULT_MODEL"; models=("$DEFAULT_MODEL" "$CODING_MODEL") ;;
+    *) fail 'Choose a listed model.'; return 1 ;;
+  esac
+  local block
+  block=$(mktemp) || return
+  trap "rm -f '$block'" EXIT
+  write_launcher_block >"$block" || return
+  . "$block"
+  if [ "$ENGINE" = ollama ]; then
+    if curl -fsS --connect-timeout 1 --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+      say 'Reusing the existing Ollama server. Restart it yourself to apply changed server settings.'
     fi
-    ok "Ollama already installed at $CUR_OLLAMA"
-  else
-    say "Downloading + installing official Ollama (needs WiFi)…"
-    curl -fsSL https://ollama.com/install.sh | sh
-    ok "Ollama installed."
-  fi
-
-  # ── 3. Start the server ────────────────────────────────────────────────────
-  hdr "3. Starting Ollama server"
-  if ! curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-    say "Launching 'ollama serve' in the background…"
-    (OLLAMA_NO_CLOUD=1 nohup ollama serve >/tmp/airplane-ollama.log 2>&1 &) || true
-    sleep 3
-  fi
-  if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-    ok "Ollama server is up on http://127.0.0.1:11434"
-  else
-    warn "Couldn't confirm server is up — check /tmp/airplane-ollama.log if needed."
-  fi
-
-  # ── 4. Pick model(s) ───────────────────────────────────────────────────────
-  hdr "4. Choose your model(s)"
-  say "Recommended by task:"
-  say "  ${BOLD}qwen3-coder:30b${RST}  → CODING (repos, edits, PRs). 19GB. ${GRN}(default)${RST}"
-  say "  ${BOLD}qwen3.6:27b${RST}      → reasoning / chat / planning. 17GB."
-  say ""
-  say "  [1] qwen3-coder:30b only        (default — coding)"
-  say "  [2] qwen3.6:27b only            (reasoning/chat)"
-  say "  [3] both                        (~36GB total)"
-  read -r -p "Pick 1/2/3 [1]: " _pick
-  _pick="${_pick:-1}"
-
-  MODELS=()
-  case "$_pick" in
-    1) MODELS=("qwen3-coder:30b") ;;
-    2) MODELS=("qwen3.6:27b") ;;
-    3) MODELS=("qwen3-coder:30b" "qwen3.6:27b") ;;
-    *) warn "Unrecognized choice — defaulting to qwen3-coder:30b"; MODELS=("qwen3-coder:30b") ;;
-  esac
-
-  hdr "Pulling model(s) — needs WiFi"
-  for m in "${MODELS[@]}"; do
-    say "→ ollama pull $m"
-    ollama pull "$m"
-    ok "Pulled $m"
-  done
-  DEFAULT_MODEL="${MODELS[0]}"
-
-  # ── 5. Write tuned env vars + launcher ─────────────────────────────────────
-  hdr "5. Writing tuned environment variables"
-  if grep -q "$MARK_BEGIN" "$PROFILE" 2>/dev/null; then
-    /usr/bin/sed -i '' "/$MARK_BEGIN/,/$MARK_END/d" "$PROFILE" 2>/dev/null || true
-  fi
-  cat >> "$PROFILE" <<EOF
-$MARK_BEGIN
-# Tuned for offline local LLM coding on Apple Silicon. Managed by airplane-mode.sh.
-# Engine: ollama
-export OLLAMA_CONTEXT_LENGTH=64000     # coding needs a big context window
-export OLLAMA_FLASH_ATTENTION=1        # cut memory growth as context grows
-export OLLAMA_KV_CACHE_TYPE=q8_0       # ~half KV cache memory, ~no quality loss
-export OLLAMA_KEEP_ALIVE=-1            # keep model pinned in memory
-export OLLAMA_NO_CLOUD=1               # force true offline — never phone home
-
-# 'airplane-mode' launcher: boots OpenCode wired to your local model.
-airplane-mode() {
-  local model="\${1:-$DEFAULT_MODEL}"
-  if ! curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-    echo "Starting ollama serve…"
-    (nohup ollama serve >/tmp/airplane-ollama.log 2>&1 &)
-    sleep 2
-  fi
-  echo "✈  Airplane Mode — launching OpenCode with \$model"
-  ollama launch opencode --model "\$model"
-}
-$MARK_END
-EOF
-  ok "Wrote env vars + 'airplane-mode' launcher to $PROFILE"
-
-# =============================================================================
-#  ENGINE: LLAMA.CPP  (power-user path — talk to the engine directly)
-# =============================================================================
-else
-
-  # ── 2. Install llama.cpp (via Homebrew) ────────────────────────────────────
-  hdr "2. Installing llama.cpp"
-  say "${DIM}Note: Ollama is itself a wrapper around llama.cpp. This path uses the${RST}"
-  say "${DIM}engine directly — more control, fewer abstractions, full credit upstream.${RST}"
-  if command -v llama-server >/dev/null 2>&1; then
-    ok "llama-server already installed at $(command -v llama-server)"
-  elif command -v brew >/dev/null 2>&1; then
-    say "Installing llama.cpp via Homebrew (needs WiFi)…"
-    brew install llama.cpp
-    ok "llama.cpp installed."
-  else
-    err "Homebrew not found. Install it from https://brew.sh, then re-run."
-    err "(Or build llama.cpp from source: https://github.com/ggml-org/llama.cpp)"
-    exit 1
-  fi
-
-  # ── 3. Pick model (GGUF from HuggingFace) ──────────────────────────────────
-  hdr "3. Choose your model"
-  say "Recommended by task (GGUF from HuggingFace, downloaded by llama-server):"
-  say "  ${BOLD}Qwen3-Coder-30B${RST}   → CODING (repos, edits, PRs). ${GRN}(default)${RST}"
-  say "  ${BOLD}Qwen3-30B (3.6)${RST}   → reasoning / chat / planning."
-  say ""
-  say "  [1] Qwen3-Coder-30B  (coding, default)"
-  say "  [2] Qwen3-30B        (reasoning/chat)"
-  read -r -p "Pick 1/2 [1]: " _pick
-  _pick="${_pick:-1}"
-  case "$_pick" in
-    1) HF_REPO="Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M"; ALIAS="qwen3-coder-30b" ;;
-    2) HF_REPO="Qwen/Qwen3-30B-A3B-GGUF:Q4_K_M";                 ALIAS="qwen3-30b" ;;
-    *) warn "Defaulting to Qwen3-Coder-30B"; HF_REPO="Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M"; ALIAS="qwen3-coder-30b" ;;
-  esac
-  say ""
-  warn "If that exact HF repo/quant 404s, browse https://huggingface.co/models?search=qwen3+gguf"
-  warn "and edit HF_REPO in your shell profile to a repo that exists (e.g. an unsloth GGUF)."
-
-  # ── 4. Pre-download the GGUF (so it's cached for offline use) ───────────────
-  hdr "4. Pre-downloading the model (needs WiFi)"
-  say "Fetching ${HF_REPO} into the llama.cpp cache so it works offline later…"
-  set +e
-  llama-server -hf "$HF_REPO" --no-webui -c 1 --port 18080 >/tmp/airplane-llamacpp-dl.log 2>&1 &
-  DL_PID=$!
-  # Wait for the model to be cached (download complete) then stop the temp server
-  for _ in $(seq 1 600); do
-    grep -q "server is listening" /tmp/airplane-llamacpp-dl.log 2>/dev/null && break
-    kill -0 "$DL_PID" 2>/dev/null || break
-    sleep 1
-  done
-  kill "$DL_PID" 2>/dev/null || true
-  wait "$DL_PID" 2>/dev/null || true
-  set -e
-  ok "Model cached (see /tmp/airplane-llamacpp-dl.log if you need detail)."
-
-  # ── 5. Write the launcher (tuned llama-server flags) ───────────────────────
-  hdr "5. Writing the 'airplane-mode' launcher"
-  if grep -q "$MARK_BEGIN" "$PROFILE" 2>/dev/null; then
-    /usr/bin/sed -i '' "/$MARK_BEGIN/,/$MARK_END/d" "$PROFILE" 2>/dev/null || true
-  fi
-  cat >> "$PROFILE" <<EOF
-$MARK_BEGIN
-# Tuned for offline local LLM coding on Apple Silicon. Managed by airplane-mode.sh.
-# Engine: llama.cpp
-export AIRPLANE_HF_REPO="$HF_REPO"
-export AIRPLANE_MODEL_ALIAS="$ALIAS"
-
-# Start tuned llama-server (Anthropic + OpenAI compatible) in the background.
-airplane-serve() {
-  local repo="\${1:-\$AIRPLANE_HF_REPO}"
-  echo "✈  Starting llama-server with \$repo …"
-  # Tuned flags: 64k ctx, flash attention, q8_0 KV cache, qwen coding sampler,
-  # offline (use cache only), reasoning budget caps runaway thinking.
-  nohup llama-server \\
-    -hf "\$repo" \\
-    --alias "\$AIRPLANE_MODEL_ALIAS" \\
-    --host 127.0.0.1 --port 8080 \\
-    -c 64000 \\
-    -fa on \\
-    -ctk q8_0 -ctv q8_0 \\
-    --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 \\
-    --presence-penalty 0.0 --repeat-penalty 1.0 \\
-    --reasoning-budget 2048 \\
-    --offline \\
-    --no-webui \\
-    >/tmp/airplane-llamacpp.log 2>&1 &
-  echo "   logs: /tmp/airplane-llamacpp.log  ·  API: http://127.0.0.1:8080"
-}
-
-# 'airplane-mode' launcher: ensure llama-server is up, then start OpenCode.
-airplane-mode() {
-  if ! curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
-    airplane-serve
-    echo -n "   waiting for model to load"
-    for _ in \$(seq 1 180); do
-      curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1 && break
-      echo -n "."; sleep 1
+    _airplane_ready || return
+    for arg in "${models[@]}"; do
+      if ! ollama show "$arg" >/dev/null 2>&1; then ollama pull "$arg" || return; fi
     done
-    echo ""
+  else
+    prepare_llama_model || return
   fi
-  echo "✈  Airplane Mode — launching OpenCode (llama.cpp @ :8080)"
-  # Point OpenCode at the local llama-server OpenAI-compatible endpoint.
-  OPENAI_BASE_URL="http://127.0.0.1:8080/v1" OPENAI_API_KEY="sk-local" \\
-    opencode
+  say 'Checking the generated launcher and a local model response.'
+  _airplane_smoke || return
+  PROFILE="$HOME/.zshrc"
+  [ -n "${ZSH_VERSION:-}" ] || [ -f "$PROFILE" ] || PROFILE="$HOME/.bashrc"
+  replace_profile_block "$block" || return
+  rm -f "$block"
+  trap - EXIT
+  say "Ready. Run: source $PROFILE"
+  say 'Then run airplane-mode. Turn Wi-Fi off and complete a real task before travelling.'
 }
-$MARK_END
-EOF
-  ok "Wrote 'airplane-mode' + 'airplane-serve' launchers to $PROFILE"
-  DEFAULT_MODEL="$ALIAS"
-fi
 
-# ── 6. Install OpenCode (the only harness — open source, by SST) ─────────────
-hdr "6. Installing OpenCode harness"
-if command -v opencode >/dev/null 2>&1; then
-  ok "OpenCode already installed at $(command -v opencode)"
-else
-  say "Installing OpenCode (needs WiFi)…"
-  curl -fsSL https://opencode.ai/install | bash
-  ok "OpenCode installed."
-fi
-
-# ── 7. Smoke test ────────────────────────────────────────────────────────────
-SMOKE_TIMEOUT=180   # 3 minutes
-hdr "7. Smoke test (loads model on GPU)"
-say "Confirming the model loads and responds."
-say "${DIM}First run loads the whole model into memory — this can take a while.${RST}"
-say "${DIM}Local harnesses with big system prompts (e.g. Claude Code) can be even${RST}"
-say "${DIM}slower on the first call. Allowing up to ${SMOKE_TIMEOUT}s before giving up.${RST}"
-say ""
-
-TIMEOUT_BIN=""
-if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
-elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"; fi
-
-say "${DIM}── model output below ─────────────────────────────────────────${RST}"
-set +e
-if [ "$ENGINE" = "ollama" ]; then
-  if [ -n "$TIMEOUT_BIN" ]; then
-    echo "say hi" | "$TIMEOUT_BIN" "${SMOKE_TIMEOUT}" ollama run "$DEFAULT_MODEL"; RC=$?
-  else
-    warn "(no 'timeout' command — running without a hard time limit)"
-    echo "say hi" | ollama run "$DEFAULT_MODEL"; RC=$?
-  fi
-  VERIFY_HINT="ollama ps   # want PROCESSOR=100% GPU and CONTEXT=64000"
-else
-  # llama.cpp: start the tuned server, wait for health, hit the completion API
-  say "Starting llama-server for the smoke test…"
-  ( eval "$(sed -n "/$MARK_BEGIN/,/$MARK_END/p" "$PROFILE")"; airplane-serve >/dev/null 2>&1 )
-  for _ in $(seq 1 "${SMOKE_TIMEOUT}"); do
-    curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1 && break
-    sleep 1
-  done
-  if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
-    curl -fsS http://127.0.0.1:8080/completion \
-      -H "Content-Type: application/json" \
-      -d '{"prompt":"say hi","n_predict":16}' 2>/dev/null \
-      | sed 's/.*"content":"\([^"]*\)".*/\1/' || true
-    RC=0
-  else
-    RC=124
-  fi
-  VERIFY_HINT="curl http://127.0.0.1:8080/health   # {\"status\":\"ok\"} when loaded"
-fi
-set -e
-say "${DIM}───────────────────────────────────────────────────────────────${RST}"
-
-if [ "${RC:-1}" -eq 0 ]; then
-  ok "Model responded — smoke test passed."
-elif [ "${RC:-1}" -eq 124 ]; then
-  warn "Smoke test timed out after ${SMOKE_TIMEOUT}s. The model may still be loading."
-  warn "Give it another minute and try 'airplane-mode' in a new terminal."
-else
-  warn "Smoke test exited with code ${RC:-?}. Try 'airplane-mode' manually in a new terminal."
-fi
-say ""
-say "${DIM}Verify it's on the GPU (not CPU):${RST}"
-say "  ${VERIFY_HINT}"
-
-# ── 8. Done ──────────────────────────────────────────────────────────────────
-hdr "✈  READY TO FLY"
-ok "Engine: ${ENGINE} · Model: ${DEFAULT_MODEL} · OpenCode — installed and tuned."
-say ""
-say "${BOLD}Next steps:${RST}"
-say "  1. Open a NEW terminal (to load the env vars), or: source $PROFILE"
-say "  2. Run:  ${BOLD}airplane-mode${RST}            ${DIM}# launches OpenCode + your model${RST}"
-say "  3. ${BOLD}Test it with WiFi OFF on the ground${RST} before you fly."
-say ""
-if [ "$ENGINE" = "ollama" ]; then
-  say "${DIM}Model-by-task:  qwen3-coder:30b = coding · qwen3.6:27b = reasoning/chat${RST}"
-  say "${DIM}Switch models:  airplane-mode qwen3.6:27b${RST}"
-else
-  say "${DIM}Engine: llama.cpp (raw). Server logs: /tmp/airplane-llamacpp.log${RST}"
-  say "${DIM}Restart the server manually with:  airplane-serve${RST}"
-fi
-say ""
-warn "Reminder: do NOT add third-party plugins/MCP servers/skills without review."
-warn "For sensitive repos, clear agent usage with your security team."
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
