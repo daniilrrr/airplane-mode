@@ -52,8 +52,10 @@ on the model and workload. Check `ollama ps` during a real session rather than
 assuming the model fits.
 
 The launcher binds new Ollama servers to `127.0.0.1:11434` with cloud features
-disabled. It reuses existing servers without restarting them. Restart an existing
-server yourself to apply changed server settings.
+disabled and keeps the model loaded while OpenCode runs. When the session ends,
+it stops the server it started and releases its loaded models. Setup does the same
+after its checks. An existing server stays running with its original settings.
+Restart that server yourself to apply changed settings.
 
 OpenCode can read and write files and execute commands with your permissions.
 Review its actions and any plugins you add. Setup installs no extra plugins,

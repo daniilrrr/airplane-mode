@@ -111,15 +111,23 @@ COMMON
   if [ "$ENGINE" = ollama ]; then
     printf "_airplane_default_model='%s'\n" "$SELECTED_MODEL"
     cat <<'OLLAMA'
+_airplane_stop_ollama() {
+  local pid="${_airplane_ollama_pid:-}"
+  _airplane_ollama_pid=''
+  [ -n "$pid" ] || return 0
+  trap '' HUP INT TERM
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
 _airplane_ready() {
   export OLLAMA_HOST=127.0.0.1:11434 OLLAMA_NO_CLOUD=1
   export OLLAMA_CONTEXT_LENGTH=64000 OLLAMA_FLASH_ATTENTION=1
   export OLLAMA_KV_CACHE_TYPE=q8_0 OLLAMA_KEEP_ALIVE=-1
   if curl -fsS --connect-timeout 1 --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then return 0; fi
-  local log="$HOME/.airplane-ollama.log" pid
-  nohup ollama serve >"$log" 2>&1 &
-  pid=$!
-  _airplane_wait http://127.0.0.1:11434/api/tags "$pid" 60 "$log"
+  local log="$HOME/.airplane-ollama.log"
+  ollama serve >"$log" 2>&1 &
+  _airplane_ollama_pid=$!
+  _airplane_wait http://127.0.0.1:11434/api/tags "$_airplane_ollama_pid" 60 "$log"
 }
 _airplane_check() {
   _airplane_ready || return
@@ -129,12 +137,22 @@ _airplane_check() {
   fi
 }
 airplane-mode() (
+  local _airplane_ollama_pid='' _airplane_exit
+  trap '_airplane_exit=$?; _airplane_stop_ollama; exit "$_airplane_exit"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   [ "$#" -le 1 ] || { printf 'Usage: airplane-mode [model]\n' >&2; return 1; }
   local model="${1:-$_airplane_default_model}"
   _airplane_check "$model" || return
   OPENCODE_DISABLE_AUTOUPDATE=true ollama launch opencode --model "$model" -- --standalone
 )
 _airplane_smoke() (
+  local _airplane_ollama_pid='' _airplane_exit
+  trap '_airplane_exit=$?; _airplane_stop_ollama; exit "$_airplane_exit"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   _airplane_check "$_airplane_default_model" || return
   curl -fsS --connect-timeout 5 --max-time 180 http://127.0.0.1:11434/api/generate \
     -H 'Content-Type: application/json' \
@@ -256,7 +274,7 @@ prepare_llama_model() {
   say "GGUF prepared. See $log"
 }
 
-main() {
+main() (
   ENGINE=ollama
   local update=0 arg
   while [ "$#" -gt 0 ]; do
@@ -308,10 +326,15 @@ BANNER
   esac
   local block
   block=$(mktemp) || return
-  trap "rm -f '$block'" EXIT
+  trap 'rm -f "$block"' EXIT
   write_launcher_block >"$block" || return
   . "$block"
   if [ "$ENGINE" = ollama ]; then
+    local _airplane_ollama_pid='' _airplane_exit
+    trap '_airplane_exit=$?; _airplane_stop_ollama; rm -f "$block"; exit "$_airplane_exit"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     if curl -fsS --connect-timeout 1 --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
       say 'Reusing the existing Ollama server. Restart it yourself to apply changed server settings.'
     fi
@@ -328,9 +351,8 @@ BANNER
   [ -n "${ZSH_VERSION:-}" ] || [ -f "$PROFILE" ] || PROFILE="$HOME/.bashrc"
   replace_profile_block "$block" || return
   rm -f "$block"
-  trap - EXIT
   say "Ready. Run: source $PROFILE"
   say 'Then run airplane-mode. Turn Wi-Fi off and complete a real task before travelling.'
-}
+)
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

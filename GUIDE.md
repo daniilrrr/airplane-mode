@@ -32,11 +32,16 @@ applications or use a smaller model or context. Model weights, context state,
 runtime buffers, and other applications all share unified memory. Quantization
 and cache choices have model-dependent tradeoffs.
 
-The generated launcher requests 64,000 tokens of context, flash attention,
-`q8_0` cache, and indefinite keep-alive. Those settings apply before a new Ollama
-server starts. An existing server keeps its original settings. Quit that server
-or the Ollama app yourself, then run `airplane-mode` to start a tuned server.
-Setup and launch never stop an existing server. See the [Ollama FAQ](https://docs.ollama.com/faq)
+The generated launcher requests 64,000 tokens of context, flash attention, and
+a `q8_0` cache. It keeps the model loaded while OpenCode runs. When you quit,
+press Ctrl+C, or close the terminal, the launcher stops the Ollama server it
+started and releases its loaded models. Setup also stops its own server after
+preparation and checks, including failures. An existing server keeps running
+with its original settings. Quit that server or the Ollama app yourself, then
+run `airplane-mode` to start a tuned server. Avoid sharing a session-owned server
+with another session that needs to outlive it. Forced termination with SIGKILL
+cannot run cleanup. A signal sent only to the waiting launcher shell can be
+delayed until its foreground client exits. See the [Ollama FAQ](https://docs.ollama.com/faq)
 and [context documentation](https://docs.ollama.com/context-length) for adjustments.
 
 ## Maintain tools
@@ -97,5 +102,7 @@ for cache locations and server options.
   Setup refuses ambiguous replacements and keeps backups next to the profile.
 
 To verify changes to this repository without installing tools or downloading
-models, run `bash tests/launcher.sh`. It exercises the emitted launchers under
-macOS Bash and zsh with isolated command stubs.
+models, run `bash tests/launcher.sh` and `python3 tests/ollama-lifecycle.py`.
+They exercise the emitted launchers under macOS Bash and zsh with isolated
+command stubs. The lifecycle check uses live processes to verify shutdown and
+server ownership.
