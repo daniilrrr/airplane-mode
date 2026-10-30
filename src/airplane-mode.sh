@@ -278,6 +278,17 @@ main() {
     if [ "$ENGINE" = ollama ]; then update_tool ollama; else update_tool llama-server; fi
     return
   fi
+  if [ -t 1 ]; then printf '\033[1;36m'; fi
+  cat <<'BANNER'
+ █████╗ ██╗██████╗ ██████╗ ██╗      █████╗ ███╗   ██╗███████╗
+██╔══██╗██║██╔══██╗██╔══██╗██║     ██╔══██╗████╗  ██║██╔════╝
+███████║██║██████╔╝██████╔╝██║     ███████║██╔██╗ ██║█████╗
+██╔══██║██║██╔══██╗██╔═══╝ ██║     ██╔══██║██║╚██╗██║██╔══╝
+██║  ██║██║██║  ██║██║     ███████╗██║  ██║██║ ╚████║███████╗
+╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝
+                    M O D E   ✈
+BANNER
+  if [ -t 1 ]; then printf '\033[0m'; fi
   say 'Airplane Mode setup. This downloads tools and models while online.'
   say 'OpenCode runs with your file and shell permissions. Review its actions and any plugins you add.'
   local ack pick
